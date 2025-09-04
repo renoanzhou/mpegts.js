@@ -116,6 +116,9 @@ class FLVDemuxer {
             (new DataView(buf)).setInt16(0, 256, true);  // little-endian write
             return (new Int16Array(buf))[0] === 256;  // platform-spec read, if equal then LE
         })();
+        
+        // SPS optimization configuration
+        this._enableSPSOptimization = config && config.enableSPSOptimization === true;
     }
 
     destroy() {
@@ -270,6 +273,96 @@ class FLVDemuxer {
             return this._videoInitialMetadataDispatched;
         }
         return false;
+    }
+
+    /**
+     * Compare SPS parameters to determine if re-generation is needed
+     * @param {Uint8Array} arrayBuffer - AVC configuration data
+     * @param {number} dataOffset - Offset in the buffer
+     * @param {number} dataSize - Size of the data
+     * @param {DataView} dataView - DataView for the buffer
+     * @param {object} meta - Video metadata object
+     * @returns {boolean} - true if re-generation can be skipped
+     */
+    _compareSPSParameters(arrayBuffer, dataOffset, dataSize, dataView, meta) {
+        if (!this._enableSPSOptimization) {
+            return false; // Fall back to original method
+        }
+
+        try {
+            let spsCount = dataView.getUint8(5) & 31;
+            if (spsCount === 0) {
+                return false;
+            }
+
+            let spsOffset = 6;
+            let spsLen = dataView.getUint16(spsOffset, false); // Big-endian
+            spsOffset += 2;
+            
+            if (spsOffset + spsLen > dataSize) {
+                return false;
+            }
+
+            // Extract and parse the new SPS
+            let newSps = new Uint8Array(arrayBuffer, dataOffset + spsOffset, spsLen);
+            let newConfig = SPSParser.parseSPS(newSps);
+            
+            // Compare with previous SPS config if exists
+            if (meta.lastSPSConfig) {
+                let configChanged = false;
+                let changes = [];
+                
+                // Compare critical parameters that affect decoding
+                if (meta.lastSPSConfig.codec_size.width !== newConfig.codec_size.width ||
+                    meta.lastSPSConfig.codec_size.height !== newConfig.codec_size.height) {
+                    configChanged = true;
+                    changes.push('resolution');
+                }
+                
+                if (meta.lastSPSConfig.profile_string !== newConfig.profile_string) {
+                    configChanged = true;
+                    changes.push('profile');
+                }
+                
+                if (meta.lastSPSConfig.level_string !== newConfig.level_string) {
+                    configChanged = true;
+                    changes.push('level');
+                }
+                
+                if (meta.lastSPSConfig.bit_depth !== newConfig.bit_depth) {
+                    configChanged = true;
+                    changes.push('bit_depth');
+                }
+                
+                if (meta.lastSPSConfig.chroma_format !== newConfig.chroma_format) {
+                    configChanged = true;
+                    changes.push('chroma_format');
+                }
+                
+                // Check frame rate (only if it's meaningful)
+                if (newConfig.frame_rate.fixed && meta.lastSPSConfig.frame_rate.fixed) {
+                    if (Math.abs(meta.lastSPSConfig.frame_rate.fps - newConfig.frame_rate.fps) > 0.1) {
+                        configChanged = true;
+                        changes.push('framerate');
+                    }
+                }
+                
+                if (!configChanged) {
+                    Log.v(this.TAG, 'SPS optimization: Parameters unchanged, skipping re-generation');
+                    return true; // Skip re-generation
+                } else {
+                    Log.w(this.TAG, 'SPS parameters changed:', changes.join(', '));
+                }
+            }
+            
+            // Store new config for next comparison
+            meta.lastSPSConfig = newConfig;
+            return false; // Continue with re-generation
+            
+        } catch (e) {
+            Log.w(this.TAG, 'SPS parsing failed, proceeding with regeneration:', e.message);
+            return false; // Fall back to re-generation
+        }
     }
 
     // function parseChunks(chunk: ArrayBuffer, byteStart: number): number;
@@ -1266,12 +1359,17 @@ class FLVDemuxer {
             meta.timescale = this._timescale;
             meta.duration = this._duration;
         } else {
-            if (typeof meta.avcc !== 'undefined') {
+            if (typeof meta.avcc !== 'undefined') {         
                 let new_avcc = new Uint8Array(arrayBuffer, dataOffset, dataSize);
                 if (buffersAreEqual(new_avcc, meta.avcc)) {
                     // AVCDecoderConfigurationRecord is not changed, ignore it to avoid initialization segment re-generating
+                    Log.v(this.TAG, 'AVCDecoderConfigurationRecord unchanged, skipping re-initialization');
                     return;
                 } else {
+                    // Try SPS compare, if SPS is not changed, skip re-generation
+                    if (this._compareSPSParameters(arrayBuffer, dataOffset, dataSize, v, meta)) {
+                        return;
+                    }
                     Log.w(this.TAG, 'AVCDecoderConfigurationRecord has been changed, re-generate initialization segment');
                 }
             }
